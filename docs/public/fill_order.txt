@@ -1,0 +1,354 @@
+/**
+ * Order Filler - Fill the order form with position data
+ * No observers, no blocking - all action-based with callbacks
+ */
+
+const OrderFiller = {
+  // Check if protection order checkbox is currently checked
+  checkProtectionStatus() {
+    const protectionCheck = document.querySelector(
+      'span[data-test-id="otc_order_entry_new_protection_check"]'
+    );
+    const parentCheckbox = protectionCheck
+      ?.closest(".checkBox")
+      ?.querySelector("input");
+    const protectionEnabled = parentCheckbox?.checked || false;
+
+    const slCheck = document.querySelector(
+      'span[data-test-id="otc_order_entry_new_stop_loss_check"]'
+    );
+    const slCheckbox = slCheck?.closest(".checkBox")?.querySelector("input");
+    const slChecked = slCheckbox?.checked || false;
+
+    const tpCheck = document.querySelector(
+      'span[data-test-id="otc_order_entry_new_take_profit_check"]'
+    );
+    const tpCheckbox = tpCheck?.closest(".checkBox")?.querySelector("input");
+    const tpChecked = tpCheckbox?.checked || false;
+
+    return { enabled: protectionEnabled, slChecked, tpChecked };
+  },
+
+  // Get current price - delegates to PositionTool for API-based price
+  getCurrentPrice() {
+    // Use PositionTool's API-based method if available
+    if (typeof PositionTool !== "undefined" && PositionTool.getCurrentPrice) {
+      return PositionTool.getCurrentPrice();
+    }
+    // Fallback to modal DOM scraping
+    const priceEl = document.querySelector(".control-currentPrice .price");
+    if (priceEl) {
+      const text = priceEl.textContent.replace(/,/g, "");
+      return parseFloat(text) || null;
+    }
+    return null;
+  },
+
+  // Helper to set React input values
+  setNativeValue(element, value) {
+    const proto = Object.getPrototypeOf(element);
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) {
+      setter.call(element, value);
+    } else {
+      element.value = value;
+    }
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  },
+
+  // Set order type dropdown
+  setOrderType(orderType) {
+    const dropdown = document.querySelector(
+      '[data-test-id="otc_order_entry_new_type"] select'
+    );
+    if (dropdown) {
+      dropdown.value = orderType;
+      dropdown.dispatchEvent(new Event("change", { bubbles: true }));
+      console.log(`Set order type to ${orderType}`);
+    }
+  },
+
+  // Normalize a value for comparison
+  _normalizeValue(val) {
+    if (val === null || val === undefined || val === "") return null;
+    const cleaned = String(val).replace(/,/g, "");
+    return parseFloat(cleaned);
+  },
+
+  // Compare two numeric values with tolerance
+  _valuesMatch(expected, actual, tolerance = 0.01) {
+    const exp = this._normalizeValue(expected);
+    const act = this._normalizeValue(actual);
+    if (exp === null || act === null) return exp === act;
+    if (isNaN(exp) || isNaN(act)) return false;
+    return Math.abs(exp - act) < tolerance;
+  },
+
+  // Verify filled values match expected data
+  verifyFill(data) {
+    const mismatches = [];
+
+    const orderTypeDropdown = document.querySelector(
+      '[data-test-id="otc_order_entry_new_type"] select'
+    );
+    if (data.orderType && orderTypeDropdown?.value !== data.orderType) {
+      mismatches.push(
+        `orderType: expected "${data.orderType}", got "${orderTypeDropdown?.value}"`
+      );
+    }
+
+    const symbolInput = document.querySelector(
+      'input[data-test-id="otc_order_entry_new_suggest"]'
+    );
+    if (data.symbol && symbolInput?.value !== data.symbol) {
+      mismatches.push(
+        `symbol: expected "${data.symbol}", got "${symbolInput?.value}"`
+      );
+    }
+
+    if (data.side) {
+      const activeBtn = document.querySelector(
+        ".control-orderSide button.button-active"
+      );
+      const activeSide = activeBtn?.dataset?.testId;
+      if (activeSide !== data.side.toUpperCase()) {
+        mismatches.push(
+          `side: expected "${data.side.toUpperCase()}", got "${activeSide}"`
+        );
+      }
+    }
+
+    const qtyInput = document.querySelector(
+      'input[data-test-id="otc_order_entry_new_quantity"]'
+    );
+    if (data.qty && !this._valuesMatch(data.qty, qtyInput?.value, 0.001)) {
+      mismatches.push(`qty: expected "${data.qty}", got "${qtyInput?.value}"`);
+    }
+
+    const priceInput = document.querySelector(
+      'input[data-test-id="otc_order_entry_new_price"]'
+    );
+    if (data.price && !this._valuesMatch(data.price, priceInput?.value, 0.1)) {
+      mismatches.push(
+        `price: expected "${data.price}", got "${priceInput?.value}"`
+      );
+    }
+
+    if (data.stopPrice) {
+      const slInput = document.querySelector(
+        'input[data-test-id="otc_order_entry_new_stop_loss_price"]'
+      );
+      if (!this._valuesMatch(data.stopPrice, slInput?.value, 1)) {
+        mismatches.push(
+          `stopPrice: expected "${data.stopPrice}", got "${slInput?.value}"`
+        );
+      }
+    }
+
+    if (data.targetPrice) {
+      const tpInput = document.querySelector(
+        'input[data-test-id="otc_order_entry_new_take_profit_price"]'
+      );
+      if (!this._valuesMatch(data.targetPrice, tpInput?.value, 1)) {
+        mismatches.push(
+          `targetPrice: expected "${data.targetPrice}", got "${tpInput?.value}"`
+        );
+      }
+    }
+
+    return { success: mismatches.length === 0, mismatches };
+  },
+
+  // Main fill function - callback-based, non-blocking
+  // callback(result) where result = { success, error?, attempts }
+  fill(data, callback, maxRetries = 5) {
+    console.log("Filling order form...", data);
+
+    // Use passed orderType - caller (ui_overlay) calculates it with fresh API price
+    const orderType = data.orderType || "LIMIT";
+    console.log(
+      `Order type: ${orderType} (entry=${data.price}, side=${data.side})`
+    );
+
+    this._fillWithRetry(data, 1, maxRetries, callback);
+  },
+
+  // Internal retry loop using setTimeout (non-blocking)
+  _fillWithRetry(data, attempt, maxRetries, callback) {
+    console.log(`Fill attempt ${attempt}/${maxRetries}`);
+
+    // Do the fill
+    this._doFill(data);
+
+    // Schedule verification after UI settles
+    // Extra time needed: 100ms for order type + 150ms for protection orders
+    const hasProtection = data.stopPrice || data.targetPrice;
+    const delay = hasProtection ? 450 : 300;
+
+    setTimeout(() => {
+      const result = this.verifyFill(data);
+
+      if (result.success) {
+        console.log(`Form fill verified on attempt ${attempt}`);
+        if (callback) callback({ success: true, attempts: attempt });
+        return;
+      }
+
+      console.warn(`Attempt ${attempt} mismatches:`, result.mismatches);
+
+      if (attempt < maxRetries) {
+        // Fix specific issues before retry
+        if (result.mismatches.some((m) => m.includes("orderType"))) {
+          this.setOrderType(data.orderType);
+        }
+        if (
+          result.mismatches.some(
+            (m) => m.includes("stopPrice") || m.includes("targetPrice")
+          )
+        ) {
+          this._setProtectionOrders(data);
+        }
+
+        // Retry after short delay
+        setTimeout(() => {
+          this._fillWithRetry(data, attempt + 1, maxRetries, callback);
+        }, 200);
+      } else {
+        const errorMsg = `Fill failed after ${maxRetries} attempts: ${result.mismatches.join(
+          ", "
+        )}`;
+        console.error(`${errorMsg}`);
+        if (callback)
+          callback({ success: false, error: errorMsg, attempts: maxRetries });
+      }
+    }, delay);
+  },
+
+  // Fill form - order type first, then other fields after UI settles
+  _doFill(data) {
+    // 1. Order type FIRST - this may cause UI to re-render
+    if (data.orderType) {
+      this.setOrderType(data.orderType);
+    }
+
+    // 2. Fill remaining fields after order type change settles
+    setTimeout(() => {
+      this._fillFields(data);
+    }, 100);
+  },
+
+  // Fill the actual form fields (called after order type is set)
+  _fillFields(data) {
+    // Symbol
+    const symbolInput = document.querySelector(
+      'input[data-test-id="otc_order_entry_new_suggest"]'
+    );
+    if (symbolInput && data.symbol) {
+      this.setNativeValue(symbolInput, data.symbol);
+    }
+
+    // Side
+    if (data.side) {
+      const sideBtn = document.querySelector(
+        `button[data-test-id="${data.side.toUpperCase()}"]`
+      );
+      if (sideBtn && !sideBtn.classList.contains("button-active")) {
+        sideBtn.click();
+      }
+    }
+
+    // Quantity
+    const qtyInput = document.querySelector(
+      'input[data-test-id="otc_order_entry_new_quantity"]'
+    );
+    if (qtyInput && data.qty) {
+      this.setNativeValue(qtyInput, data.qty.toString());
+    }
+
+    // Price
+    const priceInput = document.querySelector(
+      'input[data-test-id="otc_order_entry_new_price"]'
+    );
+    if (priceInput && data.price) {
+      this.setNativeValue(priceInput, data.price.toString());
+    }
+
+    // Protection Orders - schedule after main fields
+    if (data.stopPrice || data.targetPrice) {
+      setTimeout(() => this._setProtectionOrders(data), 150);
+    }
+  },
+
+  // Set protection orders (SL/TP)
+  _setProtectionOrders(data) {
+    // Enable parent checkbox
+    const protectionCheck = document.querySelector(
+      'span[data-test-id="otc_order_entry_new_protection_check"]'
+    );
+    if (protectionCheck) {
+      const parentCheckbox = protectionCheck
+        .closest(".checkBox")
+        ?.querySelector("input");
+      if (parentCheckbox && !parentCheckbox.checked) {
+        protectionCheck.click();
+      }
+    }
+
+    // Set SL/TP after protection enabled
+    setTimeout(() => {
+      if (data.stopPrice) {
+        const slCheck = document.querySelector(
+          'span[data-test-id="otc_order_entry_new_stop_loss_check"]'
+        );
+        if (slCheck) {
+          const checkbox = slCheck.closest(".checkBox")?.querySelector("input");
+          if (checkbox && !checkbox.checked) slCheck.click();
+        }
+        setTimeout(() => {
+          const slInput = document.querySelector(
+            'input[data-test-id="otc_order_entry_new_stop_loss_price"]'
+          );
+          if (slInput) {
+            slInput.removeAttribute("disabled");
+            this.setNativeValue(slInput, data.stopPrice.toString());
+          }
+        }, 100);
+      }
+
+      if (data.targetPrice) {
+        const tpCheck = document.querySelector(
+          'span[data-test-id="otc_order_entry_new_take_profit_check"]'
+        );
+        if (tpCheck) {
+          const checkbox = tpCheck.closest(".checkBox")?.querySelector("input");
+          if (checkbox && !checkbox.checked) tpCheck.click();
+        }
+        setTimeout(() => {
+          const tpInput = document.querySelector(
+            'input[data-test-id="otc_order_entry_new_take_profit_price"]'
+          );
+          if (tpInput) {
+            tpInput.removeAttribute("disabled");
+            this.setNativeValue(tpInput, data.targetPrice.toString());
+          }
+        }, 100);
+      }
+    }, 150);
+  },
+
+  submit() {
+    const btn = document.querySelector(
+      'button[data-test-id="otc_order_entry_new_submit_button"]'
+    );
+    if (btn) {
+      btn.click();
+      console.log("Order submitted!");
+    } else {
+      console.error("Submit button not found");
+    }
+  },
+};
+
+window.OrderFiller = OrderFiller;
+console.log("OrderFiller loaded");

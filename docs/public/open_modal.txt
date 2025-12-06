@@ -1,0 +1,142 @@
+/**
+ * Solution: Order Modal Opener
+ * Production-ready script to open order modal via _globalEvents emitter
+ * No observers - only rescans on action (button press)
+ */
+
+const ModalOpener = {
+  emitters: [],
+  lastIframeId: null,
+
+  // Clear cached emitters (call when context changes)
+  clearCache() {
+    this.emitters = [];
+    this.lastIframeId = null;
+    console.log("ModalOpener cache cleared");
+  },
+
+  // Get current iframe ID
+  _getCurrentIframeId() {
+    const iframe = document.querySelector('iframe[id^="tradingview_"]');
+    return iframe?.id || null;
+  },
+
+  // Find _globalEvents emitters from window
+  // Always checks if iframe changed first
+  findEmitters() {
+    const currentId = this._getCurrentIframeId();
+
+    // If iframe changed, clear stale emitters
+    if (this.lastIframeId && currentId && this.lastIframeId !== currentId) {
+      console.log(`Iframe changed: ${this.lastIframeId} → ${currentId}`);
+      this.emitters = [];
+    }
+    this.lastIframeId = currentId;
+
+    // Return cached if still valid
+    if (this.emitters.length > 0) return this.emitters;
+
+    // Search for emitters
+    const visited = new WeakSet();
+    const found = [];
+
+    function deepSearch(obj, path = "") {
+      if (
+        found.length > 0 ||
+        !obj ||
+        typeof obj !== "object" ||
+        visited.has(obj)
+      )
+        return;
+      visited.add(obj);
+
+      try {
+        if (
+          obj.emit &&
+          typeof obj.emit === "function" &&
+          path.includes("_globalEvents")
+        ) {
+          found.push(obj);
+          return;
+        }
+        for (let key in obj) {
+          try {
+            deepSearch(obj[key], `${path}.${key}`);
+          } catch (e) {}
+        }
+      } catch (e) {}
+    }
+
+    deepSearch(window, "window");
+    this.emitters = found;
+    console.log(`Found ${found.length} emitter(s)`);
+    return found;
+  },
+
+  // Open modal - always checks iframe first, rescans if needed
+  openModal(price = 3000, symbol = "ETHUSD") {
+    // Always find emitters fresh (checks iframe change internally)
+    this.findEmitters();
+
+    if (this.emitters.length === 0) {
+      // Force rescan - iframe might have changed
+      console.log("No emitters, forcing rescan...");
+      this.emitters = [];
+      this.lastIframeId = null;
+      this.findEmitters();
+    }
+
+    if (this.emitters.length === 0) {
+      console.error("No _globalEvents emitters found");
+      return false;
+    }
+
+    const payload = {
+      price,
+      symbol,
+      pageX: 0,
+      pageY: 0,
+      clientX: 0,
+      clientY: 0,
+      screenX: 0,
+      screenY: 0,
+    };
+
+    // Try emitters
+    let success = false;
+    for (const emitter of this.emitters) {
+      try {
+        emitter.emit("onPlusClick", payload);
+        success = true;
+        break;
+      } catch (e) {
+        // Stale emitter, continue
+      }
+    }
+
+    if (success) {
+      console.log(`Opened modal for ${symbol} @ ${price}`);
+      return true;
+    }
+
+    // All failed - force full rescan and retry once
+    console.log("Emitters stale, full rescan...");
+    this.emitters = [];
+    this.lastIframeId = null;
+    this.findEmitters();
+
+    for (const emitter of this.emitters) {
+      try {
+        emitter.emit("onPlusClick", payload);
+        console.log(`Opened modal for ${symbol} @ ${price}`);
+        return true;
+      } catch (e) {}
+    }
+
+    console.error("Failed to open modal");
+    return false;
+  },
+};
+
+window.ModalOpener = ModalOpener;
+console.log("ModalOpener loaded");

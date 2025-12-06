@@ -1,0 +1,294 @@
+/**
+ * Position Tool - Extract position data from TradingView chart
+ * Uses API for selection, extracts data directly from source
+ */
+
+const PositionTool = {
+  _chartAPI: null,
+
+  // Clear cached chart API (call when context changes)
+  clearCache() {
+    this._chartAPI = null;
+    console.log("PositionTool cache cleared");
+  },
+
+  _lastIframeId: null,
+
+  // Get TradingView chart API (checks iframe change on each call)
+  getChartAPI() {
+    try {
+      const iframe = document.querySelector('iframe[id^="tradingview_"]');
+      if (!iframe) return null;
+
+      // Check if iframe changed - clear cache if so
+      const currentId = iframe.id;
+      if (this._lastIframeId && this._lastIframeId !== currentId) {
+        console.log(`Iframe changed: ${this._lastIframeId} → ${currentId}`);
+        this._chartAPI = null;
+      }
+      this._lastIframeId = currentId;
+
+      if (this._chartAPI) return this._chartAPI;
+
+      this._chartAPI =
+        iframe.contentWindow.tradingViewApi?.activeChart() || null;
+      return this._chartAPI;
+    } catch (e) {
+      return null;
+    }
+  },
+
+  // Get current price from TradingView API (works anytime, no modal needed)
+  getCurrentPrice() {
+    try {
+      const chart = this.getChartAPI();
+      if (!chart) return null;
+
+      const mainSeries = chart.getSeries()?._model?.mainSeries?.();
+      if (!mainSeries) return null;
+
+      const lvd = mainSeries.lastValueData?.();
+      if (lvd?.formattedPriceAbsolute) {
+        return parseFloat(lvd.formattedPriceAbsolute.replace(/,/g, "")) || null;
+      }
+
+      // Fallback: get from last bar
+      const bars = chart.getSeries()?.data()?.m_bars?._items;
+      if (bars?.length > 0) {
+        return bars[bars.length - 1].value[4]; // close price
+      }
+
+      return null;
+    } catch (e) {
+      console.warn("Could not get current price from API:", e.message);
+      return null;
+    }
+  },
+
+  // Determine order type based on entry vs current price
+  getOrderType(entry, isLong, currentPrice) {
+    if (!currentPrice) return "LIMIT";
+    if (isLong) {
+      return entry > currentPrice ? "STOP" : "LIMIT";
+    } else {
+      return entry < currentPrice ? "STOP" : "LIMIT";
+    }
+  },
+
+  // Get selected source from chart selection
+  getSelectedSource() {
+    const chart = this.getChartAPI();
+    if (!chart) return null;
+    try {
+      const items = chart.selection()?._model?._selection?._items || [];
+      return items.length > 0 ? items[0] : null;
+    } catch (e) {
+      return null;
+    }
+  },
+
+  // Helper to get property value
+  _getPropValue(prop) {
+    if (!prop) return null;
+    return prop._value !== undefined ? prop._value : null;
+  },
+
+  // Extract position data from a source object
+  // shapeName is optional - used when source doesn't have toolname
+  _extractFromSource(source, shapeName = null) {
+    if (!source) return null;
+
+    // Try to get tool name from source or use provided shapeName
+    let toolName = "";
+    try {
+      toolName = source.toolname?.() || source._toolname || shapeName || "";
+    } catch (e) {
+      toolName = shapeName || "";
+    }
+
+    const isLong = toolName.toLowerCase().includes("long");
+    const isShort = toolName.toLowerCase().includes("short");
+    if (!isLong && !isShort) return null;
+
+    const props = source._properties || {};
+    const points = source.points?.() || source._points || [];
+    const entry = points[0]?.price || 0;
+
+    // Calculate prices from levels
+    const stopLevel = this._getPropValue(props.stopLevel) || 0;
+    const profitLevel = this._getPropValue(props.profitLevel) || 0;
+    const pipSize = 0.1;
+
+    const stopPrice = isLong
+      ? entry - stopLevel * pipSize
+      : entry + stopLevel * pipSize;
+    const targetPrice = isLong
+      ? entry + profitLevel * pipSize
+      : entry - profitLevel * pipSize;
+
+    // Get current price and determine order type
+    const currentPrice = this.getCurrentPrice();
+    const orderType = this.getOrderType(entry, isLong, currentPrice);
+
+    return {
+      id: source._id,
+      type: isLong ? "LONG" : "SHORT",
+      symbol: this._getPropValue(props.symbol) || "Unknown",
+      entry,
+      stopPrice,
+      targetPrice,
+      orderType,
+      currentPrice,
+      qty: this._getPropValue(props.qty),
+      riskSize: this._getPropValue(props.riskSize),
+    };
+  },
+
+  // Get selected position (primary method)
+  // Set _isRetry = true internally to avoid infinite recursion
+  getSelected(_isRetry = false) {
+    const source = this.getSelectedSource();
+    if (!source) {
+      console.log("No position selected, returning latest");
+      return this.getLatest();
+    }
+
+    // Try to determine shape name from source properties
+    let shapeName = null;
+    try {
+      // Check _properties._defaultName which contains the tool type
+      const defaultName = source._properties?._defaultName || "";
+      if (defaultName.includes("long")) shapeName = "long_position";
+      else if (defaultName.includes("short")) shapeName = "short_position";
+    } catch (e) {}
+
+    const pos = this._extractFromSource(source, shapeName);
+
+    if (pos) {
+      console.log("Found selected position");
+      this.logPosition(pos);
+      return pos;
+    }
+
+    // If no position and not a retry, try rescanning with fresh context
+    if (!_isRetry) {
+      console.log("Rescanning with fresh context...");
+      this.clearCache();
+      return this.getSelected(true);
+    }
+
+    console.log("No position selected, returning latest");
+    return this.getLatest();
+  },
+
+  // Get latest position from all shapes
+  // Set _isRetry = true internally to avoid infinite recursion on rescan
+  getLatest(_isRetry = false) {
+    const chart = this.getChartAPI();
+    if (!chart) {
+      // No chart API - try rescan once
+      if (!_isRetry) {
+        console.log("No chart API, rescanning...");
+        this.clearCache();
+        return this.getLatest(true);
+      }
+      console.log("No chart API after rescan");
+      return null;
+    }
+
+    let shapes;
+    try {
+      shapes = chart.getAllShapes();
+    } catch (e) {
+      // Chart API stale - try rescan once
+      if (!_isRetry) {
+        console.log("Chart API stale, rescanning...");
+        this.clearCache();
+        return this.getLatest(true);
+      }
+      console.log("Chart API error after rescan");
+      return null;
+    }
+
+    const positionShapes = shapes.filter(
+      (s) => s.name === "long_position" || s.name === "short_position"
+    );
+
+    if (positionShapes.length === 0) {
+      // No positions - try rescan once (chart might have changed)
+      if (!_isRetry) {
+        console.log("No positions, rescanning...");
+        this.clearCache();
+        return this.getLatest(true);
+      }
+      console.log("No positions found after rescan");
+      return null;
+    }
+
+    // Get the last one
+    const lastShape = positionShapes[positionShapes.length - 1];
+    const shapeObj = chart.getShapeById(lastShape.id);
+    // Pass shape name for type detection
+    const pos = this._extractFromSource(shapeObj?._source, lastShape.name);
+
+    if (pos) {
+      this.logPosition(pos);
+      return pos;
+    }
+
+    console.log("Could not extract position data");
+    return null;
+  },
+
+  // List all positions
+  list() {
+    const chart = this.getChartAPI();
+    if (!chart) return [];
+
+    const shapes = chart.getAllShapes();
+    const selectedSource = this.getSelectedSource();
+    const selectedId = selectedSource?._id;
+
+    const positions = shapes
+      .filter((s) => s.name === "long_position" || s.name === "short_position")
+      .map((s) => {
+        const shapeObj = chart.getShapeById(s.id);
+        // Pass shape name for type detection
+        return this._extractFromSource(shapeObj?._source, s.name);
+      })
+      .filter(Boolean);
+
+    console.log(`\nFound ${positions.length} position(s):\n`);
+    positions.forEach((p, i) => {
+      const marker = p.id === selectedId ? "→ " : "  ";
+      console.log(
+        `${marker}[${i}] ${p.type} ${p.symbol} @ ${p.entry.toFixed(2)}`
+      );
+    });
+
+    return positions;
+  },
+
+  // Log position details
+  logPosition(pos) {
+    console.log(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+POSITION EXTRACTED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Type:         ${pos.type}
+Symbol:       ${pos.symbol}
+Order Type:   ${pos.orderType}
+Entry:        ${pos.entry.toFixed(2)}
+Stop Loss:    ${pos.stopPrice.toFixed(2)}
+Take Profit:  ${pos.targetPrice.toFixed(2)}
+Quantity:     ${pos.qty?.toFixed(4) || "N/A"}
+Risk:         ${pos.riskSize ? "$" + pos.riskSize : "N/A"}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  },
+};
+
+window.PositionTool = PositionTool;
+console.log(`PositionTool loaded.
+  .getSelected()  - Get selected position (or latest)
+  .getLatest()    - Get most recent position
+  .list()         - List all positions`);
