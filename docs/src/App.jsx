@@ -278,18 +278,16 @@ ${scripts.uiOverlay}`;
           </p>
         </div>
 
-        {/* Video Placeholder */}
+        {/* Demo Video */}
         <div className="mb-12">
-          <div className="relative bg-gray-100 overflow-hidden aspect-video border-2 border-dashed border-gray-300">
-            <div className="absolute inset-0 flex items-center justify-center">
-              <div className="text-center">
-                <Play size={64} className="text-gray-400 mx-auto mb-4" />
-                <h3 className="text-xl font-semibold text-gray-600 mb-2">
-                  Demo Video
-                </h3>
-                <p className="text-gray-500">Watch Breakfills in action</p>
-              </div>
-            </div>
+          <div className="relative overflow-hidden aspect-video border-2 border-gray-300 bg-black">
+            <iframe
+              className="absolute inset-0 w-full h-full"
+              src="https://www.youtube.com/embed/r2kRB6VNYNc"
+              title="Breakfills Demo Video"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+            />
           </div>
         </div>
 
